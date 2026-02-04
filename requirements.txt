@@ -1,0 +1,28 @@
+# Waites Customer Sync Service
+# Dependencies for Railway Deployment
+
+# Web Framework
+flask==3.0.0
+gunicorn==21.2.0
+
+# HTTP Client
+requests==2.31.0
+
+# NetSuite OAuth 1.0 (Token-Based Authentication)
+requests-oauthlib==1.3.1
+oauthlib==3.2.2
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Date/Time handling
+python-dateutil==2.8.2
+
+# Type hints (for Python < 3.9 compatibility)
+typing-extensions==4.9.0
+
+# Redis (for Customer Sync state management)
+redis==5.0.1
+
+# APScheduler (for in-app cron jobs)
+APScheduler==3.10.4
