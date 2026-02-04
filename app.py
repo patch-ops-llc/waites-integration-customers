@@ -27,77 +27,66 @@ last_cron_result = None
 
 
 def _run_customer_sync_cron():
-    """Background worker for customer sync cron"""
+    """Background worker for customer sync cron
+    
+    This cron job:
+    1. Refreshes Redis from HubDB (adds new rows, updates pending/failed rows)
+    2. Processes all pending rows to NetSuite
+    """
     try:
         logger.info("🕐 Cron worker started: Customer Sync")
         
-        from redis_client import get_redis_client, CustomerSyncRow
-        
         sync = CustomerSync()
+        
+        # Step 1: Refresh Redis from HubDB
+        logger.info("📥 Step 1: Refreshing Redis from HubDB...")
+        refresh_result = sync.sync_hubdb_to_redis(preserve_existing=True)
+        
+        if not refresh_result.get('success'):
+            logger.error(f"❌ HubDB refresh failed: {refresh_result.get('error', 'Unknown error')}")
+            return
+        
+        stats = refresh_result.get('stats', {})
+        logger.info(f"   Added: {stats.get('added', 0)}, Updated: {stats.get('updated', 0)}, Preserved: {stats.get('preserved', 0)}")
+        
+        # Step 2: Process pending rows to NetSuite
+        logger.info("🔄 Step 2: Processing pending rows to NetSuite...")
+        
+        from redis_client import get_redis_client
         redis = get_redis_client()
+        redis_stats = redis.get_stats()
+        pending_count = redis_stats.get('pending', 0)
         
-        # Step 1: Fetch current HubDB rows
-        hubdb_rows = sync.fetch_hubdb_rows()
-        
-        if not hubdb_rows:
-            logger.info("No rows in HubDB or fetch failed")
+        if pending_count == 0:
+            logger.info("✅ No pending rows to sync - all customers are up to date")
             return
         
-        # Step 2: Find rows that don't exist in Redis yet (truly new)
-        new_rows = []
-        for hubdb_row in hubdb_rows:
-            row_id = str(hubdb_row.get('id', ''))
-            existing = redis.get_row(row_id)
+        logger.info(f"   Found {pending_count} pending rows to process")
+        
+        # Process all pending rows in batches
+        total_success = 0
+        total_failed = 0
+        batches_run = 0
+        max_batches = 50  # Safety limit
+        
+        while batches_run < max_batches:
+            batch_result = sync.process_next_batch()
             
-            # Only process if this row doesn't exist in Redis at all
-            if existing is None:
-                values = hubdb_row.get('values', {})
-                new_row = CustomerSyncRow(
-                    hubdb_row_id=row_id,
-                    hubspot_id=values.get('hs_id', values.get('hubspot_id', '')),
-                    netsuite_id=values.get('netsuite_id', ''),
-                    customer_id=values.get('customer_id', ''),
-                    status='pending'
-                )
-                new_rows.append(new_row)
-        
-        logger.info(f"🆕 Found {len(new_rows)} new rows to sync")
-        
-        if not new_rows:
-            logger.info("No new rows to sync")
-            return
-        
-        # Step 3: Sync new rows immediately (one at a time for rate limiting)
-        from netsuite_client import NetSuiteClient
-        from hubspot_client import HubSpotClient
-        
-        hubspot = HubSpotClient()
-        netsuite = NetSuiteClient(hubspot_client=hubspot)
-        
-        success_count = 0
-        fail_count = 0
-        
-        for row in new_rows:
-            # Add to Redis first
-            redis.upsert_row(row)
+            if not batch_result.get('success'):
+                if 'already in progress' in batch_result.get('message', ''):
+                    continue
+                break
             
-            # Sync to NetSuite
-            result = sync._sync_single_customer(row, netsuite, hubspot)
+            rows_processed = batch_result.get('rows_processed', 0)
+            if rows_processed == 0:
+                break
             
-            if result['success']:
-                success_count += 1
-            else:
-                fail_count += 1
-            
-            # Update Redis with result
-            redis.update_row_result(
-                hubdb_row_id=row.hubdb_row_id,
-                success=result['success'],
-                error=result.get('error', ''),
-                netsuite_id=result.get('netsuite_id', '')
-            )
+            total_success += batch_result.get('success_count', 0)
+            total_failed += batch_result.get('fail_count', 0)
+            batches_run += 1
         
-        logger.info(f"✅ Cron complete: Synced {success_count}/{len(new_rows)} new customers ({fail_count} failed)")
+        logger.info(f"✅ Cron complete: Processed {total_success + total_failed} customers in {batches_run} batches")
+        logger.info(f"   Success: {total_success}, Failed: {total_failed}")
         
     except Exception as e:
         logger.error(f"Cron worker failed: {e}")
